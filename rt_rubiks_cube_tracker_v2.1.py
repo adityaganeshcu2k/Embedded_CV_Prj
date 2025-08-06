@@ -6,9 +6,9 @@ import time
 
 frame_times = []
 frame_index = 0
-
+AREA_TOLERANCE = 900
 # Set this to 0 for webcam, or to a filename (e.g., 'rubiks_video.mp4')
-video_source = 'sample.mp4'
+video_source = 'sample4.mp4'
 cap = cv2.VideoCapture(video_source)
 
 # Color thresholds (only white enabled; others can be uncommented)
@@ -113,6 +113,275 @@ def is_duplicate(cx, cy, seen, thresh=10):
 def triangle_area(x1, y1, x2, y2, x3, y3):
     return 0.5 * abs(x1*(y2 - y3) + x2*(y3 - y1) + x3*(y1 - y2))
 
+def angle_between(v1, v2):
+    dot = np.dot(v1, v2)
+    norm_product = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if norm_product == 0:
+        return 0
+    cos_theta = np.clip(dot / norm_product, -1.0, 1.0)
+    return math.degrees(math.acos(cos_theta))
+
+def find_all_next_collinear_sides(centers, fixed_point, area_tol=AREA_TOLERANCE, used_points=None, allow_point=None):
+    if used_points is None:
+        used_points = set()
+
+    candidates = []
+    for c in centers:
+        if c == fixed_point:
+            continue
+        if c['index'] in used_points:
+            if allow_point is not None and c == allow_point:
+                candidates.append(c)
+            else:
+                continue
+        else:
+            candidates.append(c)
+
+    results = []
+    for p, q in itertools.combinations(candidates, 2):
+        area = triangle_area(fixed_point['cx'], fixed_point['cy'],
+                             p['cx'], p['cy'],
+                             q['cx'], q['cy'])
+        if area < area_tol:
+            d1 = dist(fixed_point, p)
+            d2 = dist(p, q)
+            d3 = dist(fixed_point, q)
+
+            pairs = [(d1, (fixed_point, p, q)),
+                     (d2, (p, q, fixed_point)),
+                     (d3, (fixed_point, q, p))]
+
+            longest, (start, end, middle) = max(pairs, key=lambda x: x[0])
+            # Ensure fixed_point is one of the endpoints, otherwise skip this triple
+            if fixed_point != start and fixed_point != end:
+                continue
+            if start != fixed_point:
+                start, end = end, start
+
+            results.append((start, end,middle))
+
+    return results
+
+
+def build_quad_from_start_line(centers, first_line, area_tol=AREA_TOLERANCE,
+                              side_ratio_thresh=1.5, angle_thresh=(30, 150),
+                              used_points=None, lines=None, depth=0):
+    if used_points is None:
+        used_points = {first_line[0]['index'], first_line[1]['index'],first_line[2]['index']}
+    else:
+        used_points = used_points.copy()
+
+    if lines is None:
+        lines = [first_line]
+    else:
+        lines = lines.copy()
+
+    # Perform early angle check if we have at least 2 sides (3 points)
+    if depth >= 2:
+        # Get the three points: prev, current, next
+        p_prev = lines[-2][0]
+        p_curr = lines[-2][1]  # same as lines[-1][0]
+        p_next = lines[-1][1]
+
+        v1 = np.array([p_prev['cx'], p_prev['cy']]) - np.array([p_curr['cx'], p_curr['cy']])
+        v2 = np.array([p_next['cx'], p_next['cy']]) - np.array([p_curr['cx'], p_curr['cy']])
+        angle_deg = angle_between(v1, v2)
+
+        if not (angle_thresh[0] <= angle_deg <= angle_thresh[1]):
+            return None  # early rejection
+
+    if depth == 3:
+        last_end = lines[-1][1]
+        first_start = lines[0][0]
+
+        if last_end != first_start:
+            return None
+
+        # Perform side ratio check
+        side_lengths = [dist(line[0], line[1]) for line in lines]
+        min_side = min(side_lengths)
+        max_side = max(side_lengths)
+        if max_side > side_ratio_thresh * min_side:
+            return None
+
+        # Reconstruct corner points
+        quad_points = []
+        for line in lines:
+            if not quad_points or quad_points[-1]['index'] != line[0]['index']:
+                quad_points.append(line[0])
+        if lines[-1][1]['index'] != quad_points[0]['index']:
+            quad_points.append(lines[-1][1])
+
+        indices = [pt['index'] for pt in quad_points]
+        if len(set(indices)) < 4:
+            print("Duplicate points found in quad:", indices)
+            return None
+
+        # Final angle check at the closing corner
+        for i in range(4):
+            prev = np.array([quad_points[i - 1]['cx'], quad_points[i - 1]['cy']])
+            curr = np.array([quad_points[i]['cx'], quad_points[i]['cy']])
+            next = np.array([quad_points[(i + 1) % 4]['cx'], quad_points[(i + 1) % 4]['cy']])
+            angle_deg = angle_between(prev - curr, next - curr)
+
+            if not (angle_thresh[0] <= angle_deg <= angle_thresh[1]):
+                return None
+
+        print("Quad found!")
+        return lines
+
+    # Get fixed point to extend the side
+    fixed_point = lines[-1][1]
+
+    possible_next_lines = find_all_next_collinear_sides(
+        centers,
+        fixed_point,
+        area_tol,
+        used_points,
+        allow_point=lines[0][0] if depth == 2 else None
+    )
+
+    for next_line in possible_next_lines:
+        if next_line[1]['index'] in used_points and next_line[1] != lines[0][0]:
+            continue
+
+        used_points.add(next_line[1]['index'])
+        new_lines = lines + [next_line]
+
+        result = build_quad_from_start_line(
+            centers,
+            first_line,
+            area_tol,
+            side_ratio_thresh,
+            angle_thresh,
+            used_points=used_points,
+            lines=new_lines,
+            depth=depth + 1
+        )
+
+        if result is not None:
+            return result
+
+        used_points.remove(next_line[1]['index'])  # backtrack
+
+    return None
+
+
+def is_parallelogram(pts, length_ratio_tol=0.25, angle_tol_deg=10.0):
+    """
+    Check if a quadrilateral (given as 4 ordered points) is a parallelogram.
+    
+    Parameters:
+        pts (list): 4 dicts, each with 'cx' and 'cy' keys.
+        length_ratio_tol (float): Allowable ratio difference for side lengths (e.g., 0.25 = 25%)
+        angle_tol_deg (float): Tolerance (in degrees) from 0° or 180° to consider sides parallel.
+        
+    Returns:
+        True if it's a parallelogram, False otherwise.
+    """
+
+    if len(pts) != 4:
+        raise ValueError("Exactly 4 points required")
+
+    def vec(p1, p2):
+        return np.array([p2['cx'] - p1['cx'], p2['cy'] - p1['cy']])
+
+    def vec_len(v):
+        return np.linalg.norm(v)
+
+    def angle_between(v1, v2):
+        cos_theta = np.clip(np.dot(v1, v2) / (vec_len(v1) * vec_len(v2) + 1e-10), -1.0, 1.0)
+        return np.degrees(np.arccos(cos_theta))
+
+    A, B, C, D = pts
+
+    AB = vec(A, B)
+    BC = vec(B, C)
+    CD = vec(C, D)
+    DA = vec(D, A)
+
+    len_AB, len_CD = vec_len(AB), vec_len(CD)
+    len_BC, len_DA = vec_len(BC), vec_len(DA)
+
+    # Check side length ratios (more flexible than absolute pixel threshold)
+    if not (1 - length_ratio_tol <= len_CD / len_AB <= 1 + length_ratio_tol):
+        return False
+    if not (1 - length_ratio_tol <= len_DA / len_BC <= 1 + length_ratio_tol):
+        return False
+
+    # Check angles between opposite sides (should be close to 0 or 180)
+    angle_AB_CD = angle_between(AB, CD)
+    angle_BC_DA = angle_between(BC, DA)
+
+    if not (angle_AB_CD < angle_tol_deg or abs(angle_AB_CD - 180) < angle_tol_deg):
+        return False
+    if not (angle_BC_DA < angle_tol_deg or abs(angle_BC_DA - 180) < angle_tol_deg):
+        return False
+
+    return True
+
+def is_middle_balanced(lines, ratio_thresh=1.5):
+    """
+    Ensures that for each line (start, end, middle), the distances from middle to start and middle to end
+    are not overly imbalanced.
+
+    Parameters:
+        lines: List of 4 tuples (start, end, middle)
+        ratio_thresh: Maximum allowed ratio between the longer and shorter distances
+
+    Returns:
+        True if all sides are balanced, False otherwise
+    """
+    def dist(p1, p2):
+        return np.hypot(p2['cx'] - p1['cx'], p2['cy'] - p1['cy'])
+
+    for i, (start, end, middle) in enumerate(lines):
+        d1 = dist(start, middle)
+        d2 = dist(end, middle)
+
+        short = min(d1, d2)
+        long = max(d1, d2)
+
+        if short < 1e-3:
+            print(f"Line {i+1}: Too short to compare reliably.")
+            return False  # avoid division by near-zero
+
+        ratio = long / short
+        if ratio > ratio_thresh:
+            print(f"Line {i+1} failed middle-balance check: ratio = {ratio:.2f} (limit {ratio_thresh})")
+            return False
+
+    return True
+
+
+def draw_quad_on_frame(frame, p1, p2, p3, p4, color=(255, 0, 255), thickness=2):
+    """
+    Draws a quadrilateral connecting the 4 given center points on the frame.
+    Points should be dicts with 'cx' and 'cy' keys.
+    """
+    try:
+        pts = np.array([
+            [p1['cx'], p1['cy']],
+            [p2['cx'], p2['cy']],
+            [p3['cx'], p3['cy']],
+            [p4['cx'], p4['cy']],
+        ], dtype=np.int32)
+    except Exception as e:
+        print("Failed to extract points for quad drawing:", e)
+        return
+
+    # Sort points clockwise (optional but consistent)
+    center = np.mean(pts, axis=0)
+    def angle(p): return np.arctan2(p[1] - center[1], p[0] - center[0])
+    pts = sorted(pts, key=angle)
+
+    pts = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+
+    # Ensure color is a tuple of ints
+    color = tuple(int(c) for c in color)
+
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+
 while cap.isOpened():
 
     start_time = time.time()
@@ -136,7 +405,7 @@ while cap.isOpened():
 
     #edges = cv2.Canny(thresh, 50, 200)
     kernel = np.ones((2, 2), np.uint8)
-    dilated_edges = cv2.dilate(thresh, kernel, iterations=4)
+    dilated_edges = cv2.dilate(thresh, kernel, iterations=5)
     # Step 2: Close gaps inside sticker areas
     closed = cv2.morphologyEx(dilated_edges, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -149,7 +418,7 @@ while cap.isOpened():
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 1000 or area > 7000:
+        if area < 1000 or area > 10000:
             continue
 
         epsilon = 0.05 * cv2.arcLength(cnt, True)
@@ -188,11 +457,11 @@ while cap.isOpened():
             if index == 13:
                 p1 = np.array([cx, cy])
                 distance = np.linalg.norm(p3 - p1)
-                print("Distance between 15 and 22 point",distance)
+                #print("Distance between 15 and 22 point",distance)
             if index == 21:
                 p2 = np.array([cx, cy])
                 distance = np.linalg.norm(p1 - p2)
-                print("Distance between 27 and 22 point",distance)
+                #print("Distance between 27 and 22 point",distance)
             if index == 4:
                 p3 = np.array([cx, cy])
 
@@ -205,164 +474,59 @@ while cap.isOpened():
         
     center_points = [(c['cx'], c['cy']) for c in centers]
 
-    AREA_TOLERANCE = 700
-
-    if frame_index == 463:
-        for p, q, r in itertools.combinations(range(1, len(centers) + 1), 3):
-            p1 = find_by_index(centers, p)
-            p2 = find_by_index(centers, q)
-            p3 = find_by_index(centers, r)
-            
-            if p1 and p2 and p3:
-                area = triangle_area(p1['cx'], p1['cy'], p2['cx'], p2['cy'], p3['cx'], p3['cy'])
-                if area < AREA_TOLERANCE:
-                    d12 = dist(p1, p2)
-                    d23 = dist(p2, p3)
-                    d13 = dist(p1, p3)
-
-                    pairs = [(d12, (p1, p2, p3)),
-                             (d23, (p2, p3, p1)),
-                             (d13, (p1, p3, p2))]
-
-                    longest, (start, end, middle) = max(pairs, key=lambda x: x[0])
-
-                    # Draw line between collinear points
-                    #cv2.line(output, (start['cx'], start['cy']), (end['cx'], end['cy']), (0, 0, 255), 1)
-
-                    if p1 == end:
-                        start_indx = p
-                        p6 = p1
-                    elif p2 == end:
-                        start_indx = q
-                        p6 = p2
-                    elif p3 == end:
-                        start_indx = r
-                        p6 = p3
 
 
-                    
-                    indices = [i for i in range(1, len(centers) + 1) if i != start_indx]
-                    
-                    for i, j in itertools.combinations(indices , 2):
-                        
-                        p4 = find_by_index(centers, i)
-                        p5 = find_by_index(centers, j)
-
-
-                        if p6 and p4 and p5:
-                            area = triangle_area(p6['cx'], p6['cy'], p4['cx'], p4['cy'], p5['cx'], p5['cy'])
-                            if area < AREA_TOLERANCE:
-                                d14 = dist(p6, p4)
-                                d45 = dist(p4, p5)
-                                d15 = dist(p6, p5)
-
-                                pairs = [(d14, (p6, p4, p5)),
-                                         (d45, (p4, p5, p6)),
-                                         (d15, (p6, p5, p4))]
-
-                                longest, (start_next, end_next, middle_next) = max(pairs, key=lambda x: x[0])
  
+    for p, q, r in itertools.combinations(range(1, len(centers) + 1), 3):
+        p1 = find_by_index(centers, p)
+        p2 = find_by_index(centers, q)
+        p3 = find_by_index(centers, r)
+        
+        if p1 and p2 and p3:
+            area = triangle_area(p1['cx'], p1['cy'], p2['cx'], p2['cy'], p3['cx'], p3['cy'])
+            if area < AREA_TOLERANCE:
+                d12 = dist(p1, p2)
+                d23 = dist(p2, p3)
+                d13 = dist(p1, p3)
 
-                                if p1 == start_next:
-                                    role = 'start'
-                                elif p1 == end_next:
-                                    role = 'end'
-                                elif p1 == middle_next:
-                                    role = 'middle'
-                                else:
-                                    role = 'not_in_triplet'  # shouldn't happen unless p1 is None
-                                #print("p4 is:", role)
+                pairs = [(d12, (p1, p2, p3)),
+                         (d23, (p2, p3, p1)),
+                         (d13, (p1, p3, p2))]
 
-                                
+                longest, (start, end, middle) = max(pairs, key=lambda x: x[0])
 
-                                # Make sure p6 == end
-                                if not (p6['cx'] == end['cx'] and p6['cy'] == end['cy']):
-                                    continue  # skip if not sharing vertex
-
-                                # Pick a point from the second triplet that is NOT the shared one
-                                for candidate in [p4, p5]:
-                                    if candidate['cx'] != end['cx'] or candidate['cy'] != end['cy']:
-                                        other = candidate
-                                        break
-                                else:
-                                    continue  # no valid point to form the second vector
-
-                                # Now compute vectors from the shared point `end`
-                                v1 = (end['cx'] - start['cx'], end['cy'] - start['cy'])
-                                v2 = (other['cx'] - end['cx'], other['cy'] - end['cy'])
+                #print(f"Triplet: {p1['index']}, {p2['index']}, {p3['index']}; Longest edge: {start['index']}->{end['index']}")
 
 
+                result = build_quad_from_start_line(centers, first_line=(start, end, middle))
 
-                                dot = v1[0]*v2[0] + v1[1]*v2[1]
-                                mag1 = math.hypot(*v1)
-                                mag2 = math.hypot(*v2)
+                if isinstance(result, str):
+                    print("sorry")
+                    #print(f"No quad chain for starting line from points {start['index']} to {end['index']}")
+                elif result:
+                    quad_lines = result  # result is a list of (start, end)
+                    for i, line in enumerate(quad_lines):
+                        start, end, middle = line
+                        #print(f"  Line {i+1}:")
+                        #print(f"    Start   idx {start['index']} -> ({start['cx']}, {start['cy']})")
+                        #print(f"    End     idx {end['index']} -> ({end['cx']}, {end['cy']})")
+                        #print(f"    Middle  idx {middle['index']} -> ({middle['cx']}, {middle['cy']})")
+                    quad_points = [line[0] for line in quad_lines]
+                    quad_points.append(quad_lines[-1][1])  # Close the loop
 
-                                if mag1 != 0 and mag2 != 0:
-                                    cos_theta = dot / (mag1 * mag2)
-                                    angle_rad = math.acos(max(-1, min(1, cos_theta)))  # Clamp to avoid math domain errors
-                                    angle_deg = math.degrees(angle_rad)
+                    
+                    #print("Final quad:")
+                    #for pt in quad_points:
+                        #print(f"  idx {pt['index']} -> ({pt['cx']}, {pt['cy']})")
+                    print(f"frame indx -> {frame_index}")
+                    if is_parallelogram(quad_points[:4]) and is_middle_balanced(quad_lines):
+                        print("=> This parallelogram passed middle balance check!")
+                        draw_quad_on_frame(output, *quad_points[:4])
+                    #else:
+                        #print("=> Parallelogram failed middle balance check.")
 
-                                    # Determine if it's acute or obtuse
-                                    nature = "Acute" if angle_deg < 90 else "Obtuse"
 
-                                    
-                                    if p1 == start:
-                                        p7 = p1
-                                    elif p2 == start:
-                                        p7 = p2
-                                    elif p3 == start:
-                                        p7 = p3
-                                    d1 = np.array([p6['cx'], p6['cy']])
-                                    d2 = np.array([p7['cx'], p7['cy']])
-                                    distance1 = np.linalg.norm(d1 - d2)
-
-                                    if p4 == end_next:
-                                        p8 = p4
-                                    elif p5 == end_next:
-                                        p8 = p5
-                                    elif p4 == start_next:
-                                        p8 = p4
-                                    elif p5 == start_next:
-                                        p8 = p5
-                                    
-                                    d3 = np.array([p6['cx'], p6['cy']])
-                                    d4 = np.array([p8['cx'], p8['cy']])
-                                    distance2 = np.linalg.norm(d3 - d4)
-                                    
-                                    if (60 <= angle_deg <= 120):
-                                        if distance1 > distance2:
-                                            if distance1 <= 1.5*distance2:
-                                                # Draw line between collinear points
-                                                cv2.line(output, (start['cx'], start['cy']), (end['cx'], end['cy']), (0, 0, 255), 1)
-                                                cv2.line(output, (start_next['cx'], start_next['cy']), (end_next['cx'], end_next['cy']), (0, 255, 0), 1)
-                                                print("p1 indx",p)
-                                                print("p2 indx",q)
-                                                print("p3 indx",r)
-                                                print("p4 indx",i)
-                                                print("p5 indx",j)
-                                                
-                                                
-                                                print("Distance between p6 and p7",distance1)
-                                                print("Distance between p6 and p8",distance2)
-                                                print(f"Angle between lines: {angle_deg:.2f} degrees ({nature})")
-                                        else:
-                                            if distance2 <= 1.5*distance1:
-                                                # Draw line between collinear points
-                                                cv2.line(output, (start['cx'], start['cy']), (end['cx'], end['cy']), (0, 0, 255), 1)
-                                                cv2.line(output, (start_next['cx'], start_next['cy']), (end_next['cx'], end_next['cy']), (0, 255, 0), 1)
-                                                print("p1 indx",p)
-                                                print("p2 indx",q)
-                                                print("p3 indx",r)
-                                                print("p4 indx",i)
-                                                print("p5 indx",j)
-                                                
-                                                
-                                                print("Distance between p6 and p7",distance1)
-                                                print("Distance between p6 and p8",distance2)
-                                                print(f"Angle between lines: {angle_deg:.2f} degrees ({nature})")
-                                                
-
-                                                                    
+                                     
 
                 
     # Save frames for debugging
