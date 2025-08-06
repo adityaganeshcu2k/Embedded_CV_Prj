@@ -8,7 +8,7 @@ frame_times = []
 frame_index = 0
 AREA_TOLERANCE = 900
 # Set this to 0 for webcam, or to a filename (e.g., 'rubiks_video.mp4')
-video_source = 'sample4.mp4'
+video_source = 'sample2.mp4'
 cap = cv2.VideoCapture(video_source)
 
 # Color thresholds (only white enabled; others can be uncommented)
