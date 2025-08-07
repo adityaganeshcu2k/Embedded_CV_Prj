@@ -8,7 +8,7 @@ frame_times = []
 frame_index = 0
 AREA_TOLERANCE = 900
 # Set this to 0 for webcam, or to a filename (e.g., 'rubiks_video.mp4')
-video_source = 'sample2.mp4'
+video_source = 'sample6.mp4'
 cap = cv2.VideoCapture(video_source)
 
 # Color thresholds (only white enabled; others can be uncommented)
@@ -214,7 +214,7 @@ def build_quad_from_start_line(centers, first_line, area_tol=AREA_TOLERANCE,
 
         indices = [pt['index'] for pt in quad_points]
         if len(set(indices)) < 4:
-            print("Duplicate points found in quad:", indices)
+            #print("Duplicate points found in quad:", indices)
             return None
 
         # Final angle check at the closing corner
@@ -227,7 +227,7 @@ def build_quad_from_start_line(centers, first_line, area_tol=AREA_TOLERANCE,
             if not (angle_thresh[0] <= angle_deg <= angle_thresh[1]):
                 return None
 
-        print("Quad found!")
+        #print("Quad found!")
         return lines
 
     # Get fixed point to extend the side
@@ -320,7 +320,7 @@ def is_parallelogram(pts, length_ratio_tol=0.25, angle_tol_deg=10.0):
 
     return True
 
-def is_middle_balanced(lines, ratio_thresh=1.5):
+def is_middle_balanced(lines, ratio_thresh=1.3):
     """
     Ensures that for each line (start, end, middle), the distances from middle to start and middle to end
     are not overly imbalanced.
@@ -343,12 +343,12 @@ def is_middle_balanced(lines, ratio_thresh=1.5):
         long = max(d1, d2)
 
         if short < 1e-3:
-            print(f"Line {i+1}: Too short to compare reliably.")
+            #print(f"Line {i+1}: Too short to compare reliably.")
             return False  # avoid division by near-zero
 
         ratio = long / short
         if ratio > ratio_thresh:
-            print(f"Line {i+1} failed middle-balance check: ratio = {ratio:.2f} (limit {ratio_thresh})")
+            #print(f"Line {i+1} failed middle-balance check: ratio = {ratio:.2f} (limit {ratio_thresh})")
             return False
 
     return True
@@ -518,9 +518,9 @@ while cap.isOpened():
                     #print("Final quad:")
                     #for pt in quad_points:
                         #print(f"  idx {pt['index']} -> ({pt['cx']}, {pt['cy']})")
-                    print(f"frame indx -> {frame_index}")
+                    #print(f"frame indx -> {frame_index}")
                     if is_parallelogram(quad_points[:4]) and is_middle_balanced(quad_lines):
-                        print("=> This parallelogram passed middle balance check!")
+                        #print("=> This parallelogram passed middle balance check!")
                         draw_quad_on_frame(output, *quad_points[:4])
                     #else:
                         #print("=> Parallelogram failed middle balance check.")
