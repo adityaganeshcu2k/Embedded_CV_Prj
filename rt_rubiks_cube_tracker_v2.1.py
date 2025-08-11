@@ -6,9 +6,9 @@ import time
 
 frame_times = []
 frame_index = 0
-AREA_TOLERANCE = 900
+AREA_TOLERANCE = 400
 # Set this to 0 for webcam, or to a filename (e.g., 'rubiks_video.mp4')
-video_source = 'sample6.mp4'
+video_source = 'sample11.mp4'
 cap = cv2.VideoCapture(video_source)
 
 # Color thresholds (only white enabled; others can be uncommented)
@@ -267,21 +267,9 @@ def build_quad_from_start_line(centers, first_line, area_tol=AREA_TOLERANCE,
     return None
 
 
-def is_parallelogram(pts, length_ratio_tol=0.25, angle_tol_deg=10.0):
-    """
-    Check if a quadrilateral (given as 4 ordered points) is a parallelogram.
-    
-    Parameters:
-        pts (list): 4 dicts, each with 'cx' and 'cy' keys.
-        length_ratio_tol (float): Allowable ratio difference for side lengths (e.g., 0.25 = 25%)
-        angle_tol_deg (float): Tolerance (in degrees) from 0° or 180° to consider sides parallel.
-        
-    Returns:
-        True if it's a parallelogram, False otherwise.
-    """
-
+def is_parallelogram(pts, length_ratio_tol=0.25, angle_tol_deg=15.0):
     if len(pts) != 4:
-        raise ValueError("Exactly 4 points required")
+        return False, "Exactly 4 points required"
 
     def vec(p1, p2):
         return np.array([p2['cx'] - p1['cx'], p2['cy'] - p1['cy']])
@@ -295,30 +283,27 @@ def is_parallelogram(pts, length_ratio_tol=0.25, angle_tol_deg=10.0):
 
     A, B, C, D = pts
 
-    AB = vec(A, B)
-    BC = vec(B, C)
-    CD = vec(C, D)
-    DA = vec(D, A)
-
+    AB, BC, CD, DA = vec(A, B), vec(B, C), vec(C, D), vec(D, A)
     len_AB, len_CD = vec_len(AB), vec_len(CD)
     len_BC, len_DA = vec_len(BC), vec_len(DA)
 
-    # Check side length ratios (more flexible than absolute pixel threshold)
-    if not (1 - length_ratio_tol <= len_CD / len_AB <= 1 + length_ratio_tol):
-        return False
-    if not (1 - length_ratio_tol <= len_DA / len_BC <= 1 + length_ratio_tol):
-        return False
+    if len_AB == 0 or len_CD == 0 or len_BC == 0 or len_DA == 0:
+        return False, "One or more sides have zero length"
 
-    # Check angles between opposite sides (should be close to 0 or 180)
+    if not (1 - length_ratio_tol <= len_CD / len_AB <= 1 + length_ratio_tol):
+        return False, f"Opposite sides AB & CD lengths differ too much ({len_AB:.2f} vs {len_CD:.2f})"
+    if not (1 - length_ratio_tol <= len_DA / len_BC <= 1 + length_ratio_tol):
+        return False, f"Opposite sides BC & DA lengths differ too much ({len_BC:.2f} vs {len_DA:.2f})"
+
     angle_AB_CD = angle_between(AB, CD)
     angle_BC_DA = angle_between(BC, DA)
 
     if not (angle_AB_CD < angle_tol_deg or abs(angle_AB_CD - 180) < angle_tol_deg):
-        return False
+        return False, f"AB & CD not parallel (angle = {angle_AB_CD:.2f}°)"
     if not (angle_BC_DA < angle_tol_deg or abs(angle_BC_DA - 180) < angle_tol_deg):
-        return False
+        return False, f"BC & DA not parallel (angle = {angle_BC_DA:.2f}°)"
 
-    return True
+    return True, "OK"
 
 def is_middle_balanced(lines, ratio_thresh=1.3):
     """
@@ -353,6 +338,52 @@ def is_middle_balanced(lines, ratio_thresh=1.3):
 
     return True
 
+def order_parallelogram_corners(pts):
+    pts_np = np.array([[p['cx'], p['cy']] if isinstance(p, dict) else p for p in pts], dtype=np.float32)
+    s = pts_np.sum(axis=1)
+    diff = np.diff(pts_np, axis=1).flatten()
+
+    ordered = [None]*4
+    ordered[0] = pts[np.argmin(s)]    # top-left
+    ordered[3] = pts[np.argmax(s)]    # bottom-right
+    ordered[1] = pts[np.argmin(diff)] # top-right
+    ordered[2] = pts[np.argmax(diff)] # bottom-left
+
+    return ordered
+
+def assign_positions_by_parallelogram(stickers, corners):
+    # corners: list of 4 dicts or tuples in order [p00, p02, p20, p22]
+    p00 = np.array([corners[0]['cx'], corners[0]['cy']], dtype=np.float32)
+    p02 = np.array([corners[1]['cx'], corners[1]['cy']], dtype=np.float32)
+    p20 = np.array([corners[2]['cx'], corners[2]['cy']], dtype=np.float32)
+    # p22 not needed for vector basis, but can be used for validation
+    
+    vec_top = p02 - p00
+    vec_left = p20 - p00
+    
+    matrix = np.column_stack((vec_top, vec_left))  # shape (2,2)
+    
+    positions = {}
+    for sticker in stickers:
+        p = np.array([sticker['cx'], sticker['cy']], dtype=np.float32)
+        rel = p - p00
+        
+        try:
+            uv = np.linalg.solve(matrix, rel)  # solves for u,v
+            u, v = uv
+            
+            # Clamp u,v between 0 and 1 for safety
+            u = np.clip(u, 0, 1)
+            v = np.clip(v, 0, 1)
+            
+            row = int(round(v * 2))
+            col = int(round(u * 2))
+            
+            positions[sticker['index']] = (row, col)
+        except np.linalg.LinAlgError:
+            # matrix not invertible
+            continue
+    return positions
 
 def draw_quad_on_frame(frame, p1, p2, p3, p4, color=(255, 0, 255), thickness=2):
     """
@@ -380,17 +411,30 @@ def draw_quad_on_frame(frame, p1, p2, p3, p4, color=(255, 0, 255), thickness=2):
     # Ensure color is a tuple of ints
     color = tuple(int(c) for c in color)
 
-    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+    #cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+
+
 
 while cap.isOpened():
 
     start_time = time.time()
     ret, frame = cap.read()
+
+    used_indices = set()  # Keep track of all points used in any detected quad
+
     if not ret:
         break
 
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    if frame_index == 164:
+
+        cv2.imwrite(f'frame_164_bgr.jpg', frame)
+        cv2.imwrite(f'frame_164_hsv.jpg', hsv_frame)
+        cv2.imwrite(f'frame_164_gray.jpg', gray)
+
+        print("Saved frame 164 (BGR, HSV, Gray)")
     #blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
     # Adaptive thresholding with larger blockSize and fine-tuned C value
@@ -418,7 +462,7 @@ while cap.isOpened():
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 1000 or area > 10000:
+        if area < 300 or area > 10000:
             continue
 
         epsilon = 0.05 * cv2.arcLength(cnt, True)
@@ -428,7 +472,7 @@ while cap.isOpened():
             continue
 
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        cv2.drawContours(mask, [approx], -1, 255, -1)  # Filled contour
+        #cv2.drawContours(mask, [approx], -1, 255, -1)  # Filled contour
 
         mean_hsv = cv2.mean(hsv_frame, mask=mask)  # Returns (H, S, V, A)
 
@@ -446,38 +490,31 @@ while cap.isOpened():
             continue
 
         seen_contours.append((area, cx, cy))
-        centers.append({ 'index': index, 'cx': cx, 'cy': cy })
+        centers.append({ 'index': index, 'cx': cx, 'cy': cy,'hsv':mean_hsv })
 
         # Determine BGR color from color_name
         bgr_color = (0, 0, 0)  # default to black
         if color_name in color_ranges:
             bgr_color = color_ranges[color_name][2]
 
-        if frame_index == 463:
-            if index == 13:
-                p1 = np.array([cx, cy])
-                distance = np.linalg.norm(p3 - p1)
-                #print("Distance between 15 and 22 point",distance)
-            if index == 21:
-                p2 = np.array([cx, cy])
-                distance = np.linalg.norm(p1 - p2)
-                #print("Distance between 27 and 22 point",distance)
-            if index == 4:
-                p3 = np.array([cx, cy])
 
         # Draw center, text, and colored contour
-        cv2.circle(output, (cx, cy), 3, (0, 0, 0), -1)
-        cv2.putText(output, f"{index}", (cx - 10, cy - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        cv2.drawContours(output, [approx], -1, bgr_color, 2)  # ← colored border
+        #cv2.circle(output, (cx, cy), 3, (0, 0, 0), -1)
+        #cv2.putText(output, f"{index}", (cx - 10, cy - 10),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        #cv2.drawContours(output, [approx], -1, bgr_color, 2)  # ← colored border
         index += 1
         
     center_points = [(c['cx'], c['cy']) for c in centers]
 
 
+    faces = []  # <--- Initialize list before the loop that finds each face
 
- 
+     
     for p, q, r in itertools.combinations(range(1, len(centers) + 1), 3):
+        if p in used_indices or q in used_indices or r in used_indices:
+            continue
+
         p1 = find_by_index(centers, p)
         p2 = find_by_index(centers, q)
         p3 = find_by_index(centers, r)
@@ -505,8 +542,8 @@ while cap.isOpened():
                     #print(f"No quad chain for starting line from points {start['index']} to {end['index']}")
                 elif result:
                     quad_lines = result  # result is a list of (start, end)
-                    for i, line in enumerate(quad_lines):
-                        start, end, middle = line
+                    #for i, line in enumerate(quad_lines):
+                    #    start, end, middle = line
                         #print(f"  Line {i+1}:")
                         #print(f"    Start   idx {start['index']} -> ({start['cx']}, {start['cy']})")
                         #print(f"    End     idx {end['index']} -> ({end['cx']}, {end['cy']})")
@@ -515,23 +552,111 @@ while cap.isOpened():
                     quad_points.append(quad_lines[-1][1])  # Close the loop
 
                     
-                    #print("Final quad:")
-                    #for pt in quad_points:
-                        #print(f"  idx {pt['index']} -> ({pt['cx']}, {pt['cy']})")
-                    #print(f"frame indx -> {frame_index}")
-                    if is_parallelogram(quad_points[:4]) and is_middle_balanced(quad_lines):
-                        #print("=> This parallelogram passed middle balance check!")
+                    ok, msg = is_parallelogram(quad_points[:4])
+                    if ok and is_middle_balanced(quad_lines):
                         draw_quad_on_frame(output, *quad_points[:4])
-                    #else:
-                        #print("=> Parallelogram failed middle balance check.")
+                        #print("Final quad:")
+                        #for pt in quad_points:
+                            #print(f"  idx {pt['index']} -> ({pt['cx']}, {pt['cy']})")
+                        #print(f"frame indx -> {frame_index}")
+                        # Collect all unique indices from start, end, and middle points in the quad
+                        quad_indices = set()
+                        for s, e, m in quad_lines:
+                            quad_indices.add(s['index'])
+                            quad_indices.add(e['index'])
+                            quad_indices.add(m['index'])
 
+                        # Add them to the global used_indices set
+                        used_indices.update(quad_indices)
+
+                        # Draw each point in the quad with its detected color
+                        for idx in quad_indices:
+                            pt_data = find_by_index(centers, idx)
+                            if pt_data:
+                                mean_hsv = pt_data['hsv']
+                                color_name = classify_color(mean_hsv)
+                                bgr_color = (0, 0, 0)  # default to black
+                                if color_name in color_ranges:
+                                    bgr_color = color_ranges[color_name][2]
+
+                                # Draw a filled circle to represent the detected color
+                                #cv2.circle(output, (pt_data['cx'], pt_data['cy']), 8, bgr_color, -1)
+                        # Get polygon vertices as (x, y) tuples
+                        poly_pts = np.array([(pt['cx'], pt['cy']) for pt in quad_points[:4]], dtype=np.int32)
+
+                        # Store the centers that belong to the face
+                        inside_centers = []  # store (index, cx, cy, hsv) for later processing
+
+
+                        # Find centers inside the parallelogram
+                        inside_indices = []
+        
+                        for c in centers:
+                            result = cv2.pointPolygonTest(poly_pts, (c['cx'], c['cy']), False)
+                            if result >= 0:  # inside or on the edge
+                                inside_indices.append(c['index'])
+                                inside_centers.append(c)
+
+                                # Optionally draw them in a special way
+                                mean_hsv = c['hsv']
+                                color_name = classify_color(mean_hsv)
+                                bgr_color = (0, 0, 0)
+                                if color_name in color_ranges:
+                                    bgr_color = color_ranges[color_name][2]
+
+                                cv2.circle(output, (c['cx'], c['cy']), 6, bgr_color, -1)
+                                #cv2.putText(output, str(c['index']), (c['cx'] + 5, c['cy'] - 5),
+                                            #cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+
+                        if inside_centers:
+                            mean_x = int(sum(c['cx'] for c in inside_centers) / len(inside_centers))
+                            mean_y = int(sum(c['cy'] for c in inside_centers) / len(inside_centers))
+                            faces.append({'center': (mean_x, mean_y), 'indices': inside_indices})
+
+                        # Get the centers for all stickers belonging to the face from quad_indices
+                        face_stickers = [find_by_index(centers, idx) for idx in quad_indices if find_by_index(centers, idx) is not None]
+
+                        ordered_corners = order_parallelogram_corners(quad_points[:4])
+                        positions = assign_positions_by_parallelogram(face_stickers,ordered_corners)
+
+                        for idx, (row, col) in positions.items():
+
+                            center = next(c for c in face_stickers if c['index'] == idx)
+                            cv2.putText(output, f"{row},{col}", (center['cx'], center['cy'] - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        # -------------------------------------------------------
+                        # After all three faces have been collected:
+                        # -------------------------------------------------------
+                        if len(faces) == 3:
+                            # Step 1: Top face = smallest y value
+                            top_face = min(faces, key=lambda f: f['center'][1])
+
+                            # Step 2: Right face = largest x among remaining
+                            remaining = [f for f in faces if f != top_face]
+                            right_face = max(remaining, key=lambda f: f['center'][0])
+
+                            # Step 3: Front face = the last one
+                            front_face = [f for f in remaining if f != right_face][0]
+
+                            print("TOP:", top_face['indices'])
+                            print("FRONT:", front_face['indices'])
+                            print("RIGHT:", right_face['indices'])
+                            # Optional: Draw labels
+                            cv2.putText(output, "TOP", top_face['center'],
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            cv2.putText(output, "FRONT", front_face['center'],
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            cv2.putText(output, "RIGHT", right_face['center'],
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        #print(f"Centers inside quad: {inside_indices}")
+                        else:
+                            print(f"Only {len(faces)} faces detected this frame")                     
 
                                      
 
                 
     # Save frames for debugging
-    #cv2.imwrite(f'gray_{frame_index:04d}.jpg', gray)
-    #cv2.imwrite(f'edges_{frame_index:04d}.jpg', edges)
     cv2.imwrite(f'dilated_{frame_index:04d}.jpg', closed)
     cv2.imwrite(f'output_{frame_index:04d}.jpg', output)
 
