@@ -8,19 +8,24 @@ frame_times = []
 frame_index = 0
 AREA_TOLERANCE = 400
 # Set this to 0 for webcam, or to a filename (e.g., 'rubiks_video.mp4')
-video_source = 'sample11.mp4'
+video_source = 'sample14.mp4'
 cap = cv2.VideoCapture(video_source)
 
-# Color thresholds (only white enabled; others can be uncommented)
 color_ranges = {
-    'white':  ([0, 0, 200],      [180, 50, 255],    (255, 255, 255)),  # low saturation, high value
-    'yellow': ([20, 100, 100],   [35, 255, 255],    (0, 255, 255)),
-    'orange': ([10, 100, 100],   [20, 255, 255],    (0, 165, 255)),
-    'blue':   ([90, 100, 100],   [130, 255, 255],   (255, 0, 0)),
-    'green':  ([40, 70, 100],    [85, 255, 255],    (0, 255, 0)),
-    'red1':   ([0, 100, 100],    [10, 255, 255],    (0, 0, 255)),      # red lower hue
-    'red2':   ([160, 100, 100],  [180, 255, 255],   (0, 0, 255)),      # red upper hue
+    'white':  ([0,   0,   210], [180, 40, 255], (255,255,255)),
+
+    # narrow gap between red and orange
+    'orange': ([8,   120, 120], [22, 255, 255], (0,165,255)),
+    'yellow': ([22,  120, 140], [32, 255, 255], (0,255,255)),
+    'green':  ([48,  110, 100], [80, 255, 255], (0,255,0)),
+    'blue':   ([100, 120,  90], [130,255, 255], (255,0,0)),
+
+    # red split very tight around the wrap
+    'red1':   ([0,   150, 100], [6,   255, 255], (0,0,255)),
+    'red2':   ([174, 150, 100], [180,255, 255], (0,0,255)),
 }
+
+
 
 def find_by_index(centers, idx):
     for c in centers:
@@ -338,18 +343,29 @@ def is_middle_balanced(lines, ratio_thresh=1.3):
 
     return True
 
-def order_parallelogram_corners(pts):
-    pts_np = np.array([[p['cx'], p['cy']] if isinstance(p, dict) else p for p in pts], dtype=np.float32)
-    s = pts_np.sum(axis=1)
-    diff = np.diff(pts_np, axis=1).flatten()
+def order_corners_centroid(pts):
+    # pts can be [{'cx':..,'cy':..}, ...] or [(x,y), ...]
+    P = np.array([[p['cx'], p['cy']] if isinstance(p, dict) else p for p in pts], dtype=np.float32)
 
-    ordered = [None]*4
-    ordered[0] = pts[np.argmin(s)]    # top-left
-    ordered[3] = pts[np.argmax(s)]    # bottom-right
-    ordered[1] = pts[np.argmin(diff)] # top-right
-    ordered[2] = pts[np.argmax(diff)] # bottom-left
+    # ensure convex quad (parallelogram is convex)
+    hull = cv2.convexHull(P).reshape(-1, 2)
+    if len(hull) != 4:
+        raise ValueError("Need 4 hull points")
 
-    return ordered
+    c = hull.mean(axis=0)
+    ang = np.arctan2(hull[:,1] - c[1], hull[:,0] - c[0])  # [-pi, pi]
+    order = np.argsort(ang)  # CCW
+    hull = hull[order]
+
+    # rotate list to start at Top-Left (smallest y, then x)
+    tl_idx = np.lexsort((hull[:,0], hull[:,1]))[0]
+    hull = np.roll(hull, -tl_idx, axis=0)  # TL, then CCW: [TL, TR, BR, BL]
+
+    # if you want clockwise TL,TR,BR,BL, reverse direction:
+    # hull = hull[[0,1,2,3]]  # already CCW TL->TR->BR->BL
+
+    TL, TR, BR, BL = hull.tolist()
+    return [TL, TR, BR, BL]
 
 def assign_positions_by_parallelogram(stickers, corners):
     # corners: list of 4 dicts or tuples in order [p00, p02, p20, p22]
@@ -411,8 +427,57 @@ def draw_quad_on_frame(frame, p1, p2, p3, p4, color=(255, 0, 255), thickness=2):
     # Ensure color is a tuple of ints
     color = tuple(int(c) for c in color)
 
-    #cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
 
+def avg(arr): 
+    return np.mean(np.array(arr, dtype=np.float32), axis=0) if arr else None
+
+def clamp(lo, x, hi): 
+    return [int(max(l, min(v, h))) for x_, l, h, v in zip([0,1,2], lo, hi, x)]
+
+calibrated = False
+
+# ---- constants you can tweak ----
+BLACK_V_MAX   = 50
+WHITE_S_MAX   = 40
+WHITE_V_MIN   = 200
+S_MIN_COLOR   = 60
+V_MIN_COLOR   = 60
+
+CANONICAL_HUES = {  # OpenCV hue in [0,180]
+    'red': 0,
+    'orange': 15,
+    'yellow': 28,
+    'green': 60,
+    'blue': 115,
+}
+ORDER = ['red','orange','yellow','green','blue']
+
+def hue_cdist(h1, h2):
+    d = abs(h1 - h2)
+    return min(d, 180 - d)
+
+def classify_hsv_median(hsv):
+    h, s, v = float(hsv[0]), float(hsv[1]), float(hsv[2])
+
+    # 0) lightness/sat gates first
+    if v < BLACK_V_MAX:
+        return 'black'
+    if s < WHITE_S_MAX and v > WHITE_V_MIN:
+        return 'white'
+    if s < S_MIN_COLOR or v < V_MIN_COLOR:
+        return 'unknown'  # too dull/dark to trust hue
+
+    # 1) non-overlapping quick bands (tune if you want)
+    if h < 10 or h >= 170:            return 'red'
+    if 10 <= h < 22:                  return 'orange'
+    if 22 <= h < 40:                  return 'yellow'
+    if 40 <= h < 85:                  return 'green'
+    if 95 <= h < 135:                 return 'blue'
+
+    # 2) fallback: nearest canonical hue on the circle
+    target = min(ORDER, key=lambda name: hue_cdist(h, CANONICAL_HUES[name]))
+    return target
 
 
 while cap.isOpened():
@@ -471,13 +536,24 @@ while cap.isOpened():
         if len(approx) > 8:
             continue
 
-        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        #cv2.drawContours(mask, [approx], -1, 255, -1)  # Filled contour
+        # inside the contour loop, after you have `approx`:
+        mask = np.zeros(frame.shape[:2], np.uint8)
+        cv2.drawContours(mask, [approx], -1, 255, cv2.FILLED)    # FILL it
+        mask = cv2.erode(mask, np.ones((3,3), np.uint8), 1)      # shave edges/speculars
 
-        mean_hsv = cv2.mean(hsv_frame, mask=mask)  # Returns (H, S, V, A)
+        ys, xs = np.where(mask > 0)
+        if len(xs) >= 20:  # avoid tiny/noisy regions
+            patch = hsv_frame[ys, xs]            # N x 3
+            h_med = float(np.median(patch[:,0]))
+            s_med = float(np.median(patch[:,1]))
+            v_med = float(np.median(patch[:,2]))
+            mean_hsv = (h_med, s_med, v_med)     # store this
+        else:
+            mean_hsv = (0.0, 0.0, 0.0)
 
-        # Classify color
-        color_name = classify_color(mean_hsv)
+        # save and classify
+        #centers.append({'index': index, 'cx': cx, 'cy': cy, 'hsv': mean_hsv})
+        color_name = classify_hsv_median(mean_hsv)
 
         M = cv2.moments(approx)
         if M["m00"] == 0:
@@ -580,7 +656,7 @@ while cap.isOpened():
                                     bgr_color = color_ranges[color_name][2]
 
                                 # Draw a filled circle to represent the detected color
-                                #cv2.circle(output, (pt_data['cx'], pt_data['cy']), 8, bgr_color, -1)
+                                cv2.circle(output, (pt_data['cx'], pt_data['cy']), 8, bgr_color, -1)
                         # Get polygon vertices as (x, y) tuples
                         poly_pts = np.array([(pt['cx'], pt['cy']) for pt in quad_points[:4]], dtype=np.int32)
 
@@ -604,9 +680,9 @@ while cap.isOpened():
                                 if color_name in color_ranges:
                                     bgr_color = color_ranges[color_name][2]
 
-                                cv2.circle(output, (c['cx'], c['cy']), 6, bgr_color, -1)
+                                #cv2.circle(output, (c['cx'], c['cy']), 6, bgr_color, -1)
                                 #cv2.putText(output, str(c['index']), (c['cx'] + 5, c['cy'] - 5),
-                                            #cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                                #            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
 
                         if inside_centers:
@@ -617,14 +693,29 @@ while cap.isOpened():
                         # Get the centers for all stickers belonging to the face from quad_indices
                         face_stickers = [find_by_index(centers, idx) for idx in quad_indices if find_by_index(centers, idx) is not None]
 
-                        ordered_corners = order_parallelogram_corners(quad_points[:4])
+                        ordered_corners_xy = order_corners_centroid(quad_points[:4])   # -> [(x,y), ...]
+                        ordered_corners = [{'cx': float(x), 'cy': float(y)} for (x, y) in ordered_corners_xy]
                         positions = assign_positions_by_parallelogram(face_stickers,ordered_corners)
 
                         for idx, (row, col) in positions.items():
 
                             center = next(c for c in face_stickers if c['index'] == idx)
-                            cv2.putText(output, f"{row},{col}", (center['cx'], center['cy'] - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                            # Get the sticker's classified color
+                            mean_hsv = center['hsv']
+                            color_name = classify_color(mean_hsv)
+                            bgr_color = (255, 255, 255)  # fallback
+                            if color_name in color_ranges:
+                                bgr_color = color_ranges[color_name][2]
+
+                            # Draw filled circle with sticker color
+                            #cv2.circle(output, (center['cx'], center['cy']), 6, bgr_color, -1)
+
+                            # Draw label in contrasting color (black on bright stickers, white on dark)
+                            brightness = sum(bgr_color) / 3
+                            text_color = (0, 0, 0) if brightness > 127 else (255, 255, 255)
+                            #cv2.putText(output, f"{row},{col}", 
+                            #            (center['cx'] - 10, center['cy'] - 10),
+                            #            cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1)
                         # -------------------------------------------------------
                         # After all three faces have been collected:
                         # -------------------------------------------------------
@@ -639,10 +730,19 @@ while cap.isOpened():
                             # Step 3: Front face = the last one
                             front_face = [f for f in remaining if f != right_face][0]
 
+                            for idx in front_face['indices']:
+                                sticker = find_by_index(centers, idx)
+                                if sticker:
+                                    cx, cy = sticker['cx'], sticker['cy']
+                                    mean_hsv = sticker['hsv']
+                                    print(f"Index {idx}: HSV={mean_hsv}  -> ({cx}, {cy})")
                             print("TOP:", top_face['indices'])
                             print("FRONT:", front_face['indices'])
                             print("RIGHT:", right_face['indices'])
                             # Optional: Draw labels
+                            # ... inside: if len(faces) == 3:
+
+                            
                             cv2.putText(output, "TOP", top_face['center'],
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                             cv2.putText(output, "FRONT", front_face['center'],
